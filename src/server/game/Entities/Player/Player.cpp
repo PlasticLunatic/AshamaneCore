@@ -1360,6 +1360,9 @@ void Player::Update(uint32 p_time)
     UpdateEnchantTime(p_time);
     UpdateHomebindTime(p_time);
 
+    for (auto itr = _garrisons.begin(); itr != _garrisons.end(); ++itr)
+        itr->second->Update(p_time);
+
     if (!_instanceResetTimes.empty())
     {
         for (InstanceTimeMap::iterator itr = _instanceResetTimes.begin(); itr != _instanceResetTimes.end();)
@@ -1571,7 +1574,7 @@ bool Player::TeleportTo(uint32 mapid, float x, float y, float z, float orientati
         if (getClass() == CLASS_DEATH_KNIGHT && GetMapId() == MAP_EBON_HOLD_DK_START_ZONE && !IsGameMaster() && !HasSpell(50977))
             return false;
 
-        if (mapid == MAP_BROKEN_ISLANDS && !IsGameMaster() && getLevel() < 98)
+        if (mapid == MAP_BROKEN_ISLANDS && !IsGameMaster() && getLevel() < 98 && getRace() != RACE_NIGHTBORNE && getRace() != RACE_HIGHMOUNTAIN_TAUREN)
             return false;
 
         // far teleport to another map
@@ -4248,8 +4251,8 @@ void Player::DeleteFromDB(ObjectGuid playerguid, uint32 accountId, bool updateRe
 
             Corpse::DeleteFromDB(playerguid, trans);
 
-            WodGarrison::DeleteFromDB(guid, trans);
-            ClassHall::DeleteFromDB(guid, trans);
+            for (uint8 garrType = GARRISON_TYPE_MIN; garrType < GARRISON_TYPE_MAX; ++garrType)
+                Garrison::DeleteFromDB(trans, guid, GarrisonType(garrType));
 
             sWorld->DeleteCharacterInfo(playerguid);
             break;
@@ -5457,6 +5460,8 @@ bool Player::UpdateGatherSkill(uint32 SkillId, uint32 SkillValue, uint32 RedLeve
                 return UpdateSkillPro(SkillId, SkillGainChance(SkillValue, RedLevel+100, RedLevel+50, RedLevel+25)*Multiplicator, gathering_skill_gain);
             else
                 return UpdateSkillPro(SkillId, (SkillGainChance(SkillValue, RedLevel+100, RedLevel+50, RedLevel+25)*Multiplicator) >> (SkillValue/sWorld->getIntConfig(CONFIG_SKILL_CHANCE_MINING_STEPS)), gathering_skill_gain);
+        case SKILL_ARCHAEOLOGY:
+            return UpdateSkillPro(SkillId, SkillValue < 50 ? 100 : 0, gathering_skill_gain);
     }
     return false;
 }
@@ -7136,6 +7141,19 @@ uint32 Player::GetCurrencyTotalCap(CurrencyTypesEntry const* currency) const
             uint32 justicecap = sWorld->getIntConfig(CONFIG_CURRENCY_MAX_JUSTICE_POINTS);
             if (justicecap > 0)
                 cap = justicecap;
+            break;
+        }
+        case CURRENCY_TYPE_ARCHAEOLOGY_DRAENEI:
+        case CURRENCY_TYPE_ARCHAEOLOGY_DWARF:
+        case CURRENCY_TYPE_ARCHAEOLOGY_FOSSIL:
+        case CURRENCY_TYPE_ARCHAEOLOGY_NERUBIAN:
+        case CURRENCY_TYPE_ARCHAEOLOGY_NIGHT_ELF:
+        case CURRENCY_TYPE_ARCHAEOLOGY_ORC:
+        case CURRENCY_TYPE_ARCHAEOLOGY_TOLVIR:
+        case CURRENCY_TYPE_ARCHAEOLOGY_TROLL:
+        case CURRENCY_TYPE_ARCHAEOLOGY_VRYKUL:
+        {
+            cap = 200;
             break;
         }
     }
@@ -20401,10 +20419,9 @@ bool Player::CheckInstanceValidity(bool /*isLogin*/)
         return true;
 
     // raid instances require the player to be in a raid group to be valid
-    if (map->IsRaid() && !sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_RAID))
-        if (map->GetEntry()->Expansion() >= uint8(CURRENT_EXPANSION))
-            if (!GetGroup() || !GetGroup()->isRaidGroup())
-                return false;
+    if (map->IsRaid() && !sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_RAID) && (map->GetEntry()->Expansion() >= sWorld->getIntConfig(CONFIG_EXPANSION)))
+        if (!GetGroup() || !GetGroup()->isRaidGroup())
+            return false;
 
     if (Group* group = GetGroup())
     {
@@ -22762,13 +22779,12 @@ bool Player::ActivateTaxiPathTo(std::vector<uint32> const& nodes, Creature* npc 
     if (npc)
     {
         // not let cheating with start flight mounted
-        if (IsMounted())
-        {
-            GetSession()->SendActivateTaxiReply(ERR_TAXIPLAYERALREADYMOUNTED);
-            return false;
-        }
+        RemoveAurasByType(SPELL_AURA_MOUNTED);
 
-        if (IsInDisallowedMountForm())
+        if (GetDisplayId() != GetNativeDisplayId())
+            RestoreDisplayId(true);
+
+        if (IsDisallowedMountForm(getTransForm(), FORM_NONE, GetDisplayId()))
         {
             GetSession()->SendActivateTaxiReply(ERR_TAXIPLAYERSHAPESHIFTED);
             return false;
@@ -22786,8 +22802,8 @@ bool Player::ActivateTaxiPathTo(std::vector<uint32> const& nodes, Creature* npc 
     {
         RemoveAurasByType(SPELL_AURA_MOUNTED);
 
-        if (IsInDisallowedMountForm())
-            RemoveAurasByType(SPELL_AURA_MOD_SHAPESHIFT);
+        if (GetDisplayId() != GetNativeDisplayId())
+            RestoreDisplayId(true);
 
         if (Spell* spell = GetCurrentSpell(CURRENT_GENERIC_SPELL))
             if (spell->m_spellInfo->Id != spellid)
@@ -28570,11 +28586,22 @@ void Player::SendGarrisonInfo() const
         {
             garrisonInfo.Missions.push_back(&p.second.PacketInfo);
             garrisonInfo.MissionRewards.push_back(p.second.Rewards);
-            garrisonInfo.MissionOvermaxRewards.push_back(p.second.OvermaxRewards);
+            garrisonInfo.MissionBonusRewards.push_back(p.second.BonusRewards);
             garrisonInfo.CanStartMission.push_back(p.second.CanStartMission);
         }
 
         garrisonInfoResult.Garrisons.push_back(garrisonInfo);
+    }
+
+    for (uint32 i = 0; i < sGarrFollowerTypeStore.GetNumRows(); ++i)
+    {
+        if (GarrFollowerTypeEntry const* followerTypeEntry = sGarrFollowerTypeStore.LookupEntry(i))
+        {
+            WorldPackets::Garrison::FollowerSoftCapInfo followerSoftCapInfo;
+            followerSoftCapInfo.GarrFollowerTypeID = followerTypeEntry->ID;
+            followerSoftCapInfo.Count = followerTypeEntry->MaxFollowers;
+            garrisonInfoResult.FollowerSoftCaps.push_back(followerSoftCapInfo);
+        }
     }
 
     SendDirectMessage(garrisonInfoResult.Write());
